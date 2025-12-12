@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type Candidate = {
     provider: string;
@@ -21,6 +21,54 @@ function isErr(x: any): x is ErrResp {
     return typeof x?.error === "string";
 }
 
+function useTypewriter(text: string, opts?: { cps?: number; startDelayMs?: number }) {
+    const cps = opts?.cps ?? 70; // characters per second
+    const startDelayMs = opts?.startDelayMs ?? 120;
+
+    const [out, setOut] = useState("");
+    const [done, setDone] = useState(true);
+    const timerRef = useRef<number | null>(null);
+    const idxRef = useRef(0);
+
+    useEffect(() => {
+        // reset
+        if (timerRef.current) window.clearInterval(timerRef.current);
+        setOut("");
+        setDone(false);
+        idxRef.current = 0;
+
+        if (!text) {
+            setDone(true);
+            return;
+        }
+
+        const msPerChar = Math.max(5, Math.floor(1000 / cps));
+
+        const start = window.setTimeout(() => {
+            timerRef.current = window.setInterval(() => {
+                // burst mode: type a few chars per tick for smoothness
+                const burst = 2;
+                idxRef.current = Math.min(text.length, idxRef.current + burst);
+                setOut(text.slice(0, idxRef.current));
+
+                if (idxRef.current >= text.length) {
+                    if (timerRef.current) window.clearInterval(timerRef.current);
+                    timerRef.current = null;
+                    setDone(true);
+                }
+            }, msPerChar);
+        }, startDelayMs);
+
+        return () => {
+            window.clearTimeout(start);
+            if (timerRef.current) window.clearInterval(timerRef.current);
+            timerRef.current = null;
+        };
+    }, [text, cps, startDelayMs]);
+
+    return { out, done, setOut };
+}
+
 export default function Home() {
     const [prompt, setPrompt] = useState("");
     const [mode, setMode] = useState<"fast" | "quality">("fast");
@@ -33,6 +81,18 @@ export default function Home() {
     const [err, setErr] = useState("");
 
     const canAsk = useMemo(() => prompt.trim().length > 0 && !loading, [prompt, loading]);
+
+    const { out: typedFinal, done: typingDone, setOut: forceTypedOut } = useTypewriter(finalAnswer, {
+        cps: mode === "fast" ? 90 : 70,
+        startDelayMs: 120,
+    });
+
+    // Auto-scroll the output panel as it types
+    const outputRef = useRef<HTMLDivElement | null>(null);
+    useEffect(() => {
+        if (!outputRef.current) return;
+        outputRef.current.scrollTop = outputRef.current.scrollHeight;
+    }, [typedFinal]);
 
     async function ask() {
         setLoading(true);
@@ -60,9 +120,9 @@ export default function Home() {
                 throw new Error(isErr(data) ? data.error : `Request failed (${res.status})`);
             }
 
-            setFinalAnswer(data.final);
-            setCandidates(data.candidates ?? []);
             setCached(Boolean(data.cached));
+            setCandidates(data.candidates ?? []);
+            setFinalAnswer(data.final ?? "");
         } catch (e: any) {
             setErr(e?.message ?? "Unknown error");
         } finally {
@@ -70,21 +130,33 @@ export default function Home() {
         }
     }
 
+    function skipTyping() {
+        // Instantly show full answer
+        forceTypedOut(finalAnswer);
+    }
+
     return (
         <main className="min-h-screen bg-zinc-950 text-zinc-100">
-            <div className="mx-auto max-w-5xl px-4 py-10">
+            {/* subtle background glow */}
+            <div className="pointer-events-none fixed inset-0 opacity-30">
+                <div className="absolute -top-24 left-1/2 h-72 w-[42rem] -translate-x-1/2 rounded-full bg-emerald-500 blur-3xl" />
+                <div className="absolute top-40 left-1/4 h-72 w-72 rounded-full bg-sky-500 blur-3xl" />
+                <div className="absolute top-56 right-1/4 h-72 w-72 rounded-full bg-fuchsia-500 blur-3xl" />
+            </div>
+
+            <div className="relative mx-auto max-w-5xl px-4 py-10">
                 {/* Header */}
                 <div className="flex flex-col gap-2">
-                    <div className="inline-flex items-center gap-2">
-            <span className="rounded-lg bg-zinc-900 px-2 py-1 text-xs font-semibold text-emerald-300 ring-1 ring-zinc-800">
+                    <div className="inline-flex flex-wrap items-center gap-2">
+            <span className="rounded-lg bg-zinc-900/70 px-2 py-1 text-xs font-semibold text-emerald-300 ring-1 ring-zinc-800 backdrop-blur">
               local • ensemble
             </span>
                         {cached && (
-                            <span className="rounded-lg bg-zinc-900 px-2 py-1 text-xs font-semibold text-sky-300 ring-1 ring-zinc-800">
+                            <span className="rounded-lg bg-zinc-900/70 px-2 py-1 text-xs font-semibold text-sky-300 ring-1 ring-zinc-800 backdrop-blur">
                 cache hit
               </span>
                         )}
-                        <span className="rounded-lg bg-zinc-900 px-2 py-1 font-mono text-xs text-zinc-400 ring-1 ring-zinc-800">
+                        <span className="rounded-lg bg-zinc-900/70 px-2 py-1 font-mono text-xs text-zinc-400 ring-1 ring-zinc-800 backdrop-blur">
               mode:{mode}
             </span>
                     </div>
@@ -96,7 +168,7 @@ export default function Home() {
                     </h1>
 
                     <p className="max-w-2xl text-sm text-zinc-400">
-                        Fast mode: 2 models + smart shortcuts. Quality mode: 3 models + judge + synthesis.
+                        Fast mode: 2 models + shortcuts. Quality mode: 3 models + judge + synthesis.
                     </p>
                 </div>
 
@@ -163,17 +235,84 @@ export default function Home() {
                     </div>
                 </div>
 
-                {/* Final Answer */}
-                {finalAnswer && (
-                    <div className="mt-8 rounded-2xl bg-zinc-900/60 p-5 ring-1 ring-zinc-800 backdrop-blur">
-                        <div className="flex items-center justify-between">
-                            <h2 className="text-sm font-semibold text-zinc-200">Final answer</h2>
-                            <span className="rounded-lg bg-zinc-950 px-2 py-1 font-mono text-xs text-zinc-400 ring-1 ring-zinc-800">
-                /answer
-              </span>
+                {/* Final Answer (terminal style + typing) */}
+                {(finalAnswer || loading) && (
+                    <div className="mt-8 overflow-hidden rounded-2xl ring-1 ring-zinc-800">
+                        {/* terminal top bar */}
+                        <div className="flex items-center justify-between bg-zinc-900/80 px-4 py-3 backdrop-blur">
+                            <div className="flex items-center gap-2">
+                                <span className="h-3 w-3 rounded-full bg-red-400/80" />
+                                <span className="h-3 w-3 rounded-full bg-yellow-300/80" />
+                                <span className="h-3 w-3 rounded-full bg-emerald-400/80" />
+                                <span className="ml-3 font-mono text-xs text-zinc-400">stdout — /answer</span>
+                            </div>
+
+                            <div className="flex items-center gap-2">
+                                {!typingDone && finalAnswer && (
+                                    <button
+                                        onClick={skipTyping}
+                                        className="rounded-lg bg-zinc-950 px-2 py-1 text-xs font-semibold text-zinc-300 ring-1 ring-zinc-800 hover:bg-zinc-900"
+                                    >
+                                        Skip
+                                    </button>
+                                )}
+                                <span className="rounded-lg bg-zinc-950 px-2 py-1 font-mono text-xs text-zinc-400 ring-1 ring-zinc-800">
+                  {cached ? "cached" : "live"}
+                </span>
+                            </div>
                         </div>
-                        <div className="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-zinc-100">
-                            {finalAnswer}
+
+                        {/* terminal body */}
+                        <div
+                            ref={outputRef}
+                            className="max-h-[52vh] overflow-auto bg-zinc-950 px-4 py-4 font-mono text-sm leading-relaxed text-zinc-100"
+                        >
+                            {/* prompt echo */}
+                            <div className="text-zinc-400">
+                                <span className="text-emerald-300">user</span>
+                                <span className="text-zinc-600">@</span>
+                                <span className="text-sky-300">localhost</span>
+                                <span className="text-zinc-600">:</span>
+                                <span className="text-fuchsia-300">~</span>
+                                <span className="text-zinc-600">$</span>{" "}
+                                <span className="text-zinc-200">ask</span>{" "}
+                                <span className="text-zinc-500">--mode</span>{" "}
+                                <span className="text-zinc-200">{mode}</span>
+                            </div>
+
+                            <div className="mt-2 whitespace-pre-wrap">
+                                {prompt.trim() || (loading ? "…" : "")}
+                            </div>
+
+                            <div className="mt-4 text-zinc-400">
+                                <span className="text-emerald-300">assistant</span>
+                                <span className="text-zinc-600">@</span>
+                                <span className="text-sky-300">localhost</span>
+                                <span className="text-zinc-600">:</span>
+                                <span className="text-fuchsia-300">~</span>
+                                <span className="text-zinc-600">$</span>{" "}
+                                <span className="text-zinc-200">output</span>
+                            </div>
+
+                            <div className="mt-2 whitespace-pre-wrap">
+                                {loading && !finalAnswer ? (
+                                    <>
+                                        <span className="text-zinc-300">Running models…</span>
+                                        <span className="ml-2 inline-block animate-pulse text-emerald-300">█</span>
+                                    </>
+                                ) : (
+                                    <>
+                                        {typedFinal}
+                                        <span
+                                            className={`inline-block align-baseline ${
+                                                typingDone ? "animate-pulse" : "animate-pulse"
+                                            } text-emerald-300`}
+                                        >
+                      █
+                    </span>
+                                    </>
+                                )}
+                            </div>
                         </div>
                     </div>
                 )}
@@ -208,9 +347,10 @@ export default function Home() {
                 )}
 
                 <footer className="mt-12 text-center text-xs text-zinc-600">
-                    Go + Next.js • local models via Ollama • fast/quality toggle
+                    Go + Next.js • local models via Ollama • terminal UI + typewriter
                 </footer>
             </div>
         </main>
     );
 }
+
