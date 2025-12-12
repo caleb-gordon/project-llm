@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -88,12 +89,14 @@ type ollamaGenerateResp struct {
 	Response string `json:"response"`
 }
 
+type ollamaStreamResp struct {
+	Response string `json:"response"`
+	Done     bool   `json:"done"`
+	// there are other fields, we ignore them
+}
+
 func ollamaGenerate(ctx context.Context, model, prompt string) (string, error) {
-	body, _ := json.Marshal(ollamaGenerateReq{
-		Model:  model,
-		Prompt: prompt,
-		Stream: false,
-	})
+	body, _ := json.Marshal(ollamaGenerateReq{Model: model, Prompt: prompt, Stream: false})
 
 	req, err := http.NewRequestWithContext(ctx, "POST", "http://localhost:11434/api/generate", bytes.NewReader(body))
 	if err != nil {
@@ -101,7 +104,7 @@ func ollamaGenerate(ctx context.Context, model, prompt string) (string, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	cli := &http.Client{Timeout: 120 * time.Second}
+	cli := &http.Client{Timeout: 180 * time.Second}
 	resp, err := cli.Do(req)
 	if err != nil {
 		return "", err
@@ -117,6 +120,62 @@ func ollamaGenerate(ctx context.Context, model, prompt string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(out.Response), nil
+}
+
+// Stream: calls Ollama with stream:true, invokes onDelta for each chunk.
+// Returns the full concatenated text too.
+func ollamaGenerateStream(ctx context.Context, model, prompt string, onDelta func(string) error) (string, error) {
+	body, _ := json.Marshal(ollamaGenerateReq{Model: model, Prompt: prompt, Stream: true})
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "http://localhost:11434/api/generate", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	cli := &http.Client{Timeout: 0} // rely on ctx
+	resp, err := cli.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("ollama non-2xx: %s", resp.Status)
+	}
+
+	sc := bufio.NewScanner(resp.Body)
+	// Increase scanner buffer for safety
+	buf := make([]byte, 0, 64*1024)
+	sc.Buffer(buf, 4*1024*1024)
+
+	var full strings.Builder
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var chunk ollamaStreamResp
+		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+			return "", fmt.Errorf("ollama stream decode error: %v", err)
+		}
+		if chunk.Response != "" {
+			full.WriteString(chunk.Response)
+			if onDelta != nil {
+				if err := onDelta(chunk.Response); err != nil {
+					return full.String(), err
+				}
+			}
+		}
+		if chunk.Done {
+			break
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return full.String(), err
+	}
+
+	return strings.TrimSpace(full.String()), nil
 }
 
 // -------------------- Ensemble logic --------------------
@@ -140,8 +199,8 @@ func fanOut(ctx context.Context, providers []provider, userPrompt string) []Cand
 		p := p
 		go func() {
 			defer wg.Done()
-
 			start := time.Now()
+
 			prompt := "Answer the user clearly and directly.\n" +
 				"Prefer correct, concise explanations and practical examples when helpful.\n\n" +
 				"User:\n" + userPrompt
@@ -169,7 +228,7 @@ func fanOut(ctx context.Context, providers []provider, userPrompt string) []Cand
 		}
 	}
 
-	// Stable order: fastest first (nice for UI, also helps fast mode pick quickly if needed)
+	// fastest first (nice for UI)
 	sort.Slice(cands, func(i, j int) bool { return cands[i].LatencyMs < cands[j].LatencyMs })
 	return cands
 }
@@ -224,7 +283,7 @@ func judgeCandidates(ctx context.Context, judgeModel string, userPrompt string, 
 	return out, nil
 }
 
-func synthesize(ctx context.Context, synthModel string, userPrompt string, top []Candidate) (string, error) {
+func synthPrompt(userPrompt string, top []Candidate) string {
 	var b strings.Builder
 	b.WriteString("Combine the best parts of the answers below into ONE final answer.\n")
 	b.WriteString("Rules: be correct, remove contradictions, be concise, no fluff.\n")
@@ -237,12 +296,11 @@ func synthesize(ctx context.Context, synthModel string, userPrompt string, top [
 		b.WriteString(c.Provider + ":\n")
 		b.WriteString(c.Text + "\n")
 	}
-	return ollamaGenerate(ctx, synthModel, b.String())
+	return b.String()
 }
 
-// Fast heuristic: skip judge+synth if answers are “close enough”
+// Fast heuristic: pick the one with more structure (newlines), else fastest
 func fastPick(cands []Candidate) Candidate {
-	// Prefer the one with more structure (newlines/bullets), then shorter latency
 	best := cands[0]
 	bestNL := strings.Count(best.Text, "\n")
 	for _, c := range cands[1:] {
@@ -250,7 +308,6 @@ func fastPick(cands []Candidate) Candidate {
 		if nl > bestNL+1 {
 			best = c
 			bestNL = nl
-			continue
 		}
 	}
 	return best
@@ -260,7 +317,6 @@ func shouldSkipJudgeInFastMode(cands []Candidate) bool {
 	if len(cands) < 2 {
 		return true
 	}
-	// If lengths are similar, they likely agree; skip judge/synth for speed.
 	a, b := len(cands[0].Text), len(cands[1].Text)
 	diff := a - b
 	if diff < 0 {
@@ -269,8 +325,26 @@ func shouldSkipJudgeInFastMode(cands []Candidate) bool {
 	return diff < 350
 }
 
-// -------------------- HTTP handler --------------------
+// -------------------- NDJSON streaming helpers --------------------
 
+type streamMsg struct {
+	Type string `json:"type"`           // "status" | "delta" | "meta" | "error"
+	Text string `json:"text,omitempty"` // for status/delta/error
+	Meta any    `json:"meta,omitempty"` // for meta
+}
+
+func writeNDJSON(w http.ResponseWriter, v streamMsg) error {
+	b, _ := json.Marshal(v)
+	_, err := w.Write(append(b, '\n'))
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return err
+}
+
+// -------------------- Handlers --------------------
+
+// Non-stream JSON endpoint (kept for compatibility)
 func handleAnswer(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, errResp{Error: "POST only"})
@@ -294,7 +368,6 @@ func handleAnswer(w http.ResponseWriter, r *http.Request) {
 		mode = "fast"
 	}
 
-	// Cache
 	key := cacheKey(req.Prompt, mode)
 	if v, ok := cacheGet(key); ok {
 		v.Cached = true
@@ -302,14 +375,12 @@ func handleAnswer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Time budgets
 	var (
 		providers []provider
 		timeout   time.Duration
 		cacheTTL  time.Duration
 	)
 	if mode == "quality" {
-		// Quality: 3 providers + judge + synth
 		providers = []provider{
 			{name: "llama3.2", model: "llama3.2"},
 			{name: "qwen2.5", model: "qwen2.5"},
@@ -318,7 +389,6 @@ func handleAnswer(w http.ResponseWriter, r *http.Request) {
 		timeout = 120 * time.Second
 		cacheTTL = 30 * time.Minute
 	} else {
-		// Fast: 2 providers; judge/synth only when needed
 		providers = []provider{
 			{name: "llama3.2", model: "llama3.2"},
 			{name: "qwen2.5", model: "qwen2.5"},
@@ -336,7 +406,6 @@ func handleAnswer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If only 1 came back, just return it.
 	if len(cands) == 1 {
 		resp := AnswerResponse{Final: cands[0].Text, Candidates: cands, Cached: false, Mode: mode}
 		cacheSet(key, resp, cacheTTL)
@@ -344,7 +413,6 @@ func handleAnswer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// FAST MODE: often skip judge+synth
 	if mode == "fast" && shouldSkipJudgeInFastMode(cands) {
 		best := fastPick(cands)
 		resp := AnswerResponse{Final: best.Text, Candidates: cands, Cached: false, Mode: mode}
@@ -353,11 +421,9 @@ func handleAnswer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Judge + (optional) synth
 	judgeModel := "llama3.2"
 	scores, err := judgeCandidates(ctx, judgeModel, req.Prompt, cands)
 	if err != nil {
-		// Fallback: pick best heuristic
 		best := fastPick(cands)
 		resp := AnswerResponse{Final: best.Text, Candidates: cands, Cached: false, Mode: mode}
 		cacheSet(key, resp, cacheTTL)
@@ -365,22 +431,21 @@ func handleAnswer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Take top 2 for synthesis
 	top := []Candidate{cands[scores[0].Idx]}
 	if len(scores) > 1 {
 		top = append(top, cands[scores[1].Idx])
 	}
 
 	final := cands[scores[0].Idx].Text
-	// Only synthesize in quality mode OR when judge thinks top answers differ meaningfully
 	if mode == "quality" {
-		if merged, err := synthesize(ctx, judgeModel, req.Prompt, top); err == nil && strings.TrimSpace(merged) != "" {
+		merged, err := ollamaGenerate(ctx, judgeModel, synthPrompt(req.Prompt, top))
+		if err == nil && strings.TrimSpace(merged) != "" {
 			final = merged
 		}
 	} else {
-		// Fast mode: synthesize only if top answer is short or unstructured
 		if len(final) < 500 {
-			if merged, err := synthesize(ctx, judgeModel, req.Prompt, top); err == nil && strings.TrimSpace(merged) != "" {
+			merged, err := ollamaGenerate(ctx, judgeModel, synthPrompt(req.Prompt, top))
+			if err == nil && strings.TrimSpace(merged) != "" {
 				final = merged
 			}
 		}
@@ -391,8 +456,140 @@ func handleAnswer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// Streaming NDJSON endpoint
+func handleAnswerStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errResp{Error: "POST only"})
+		return
+	}
+
+	var req AnswerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp{Error: "bad json"})
+		return
+	}
+
+	req.Prompt = strings.TrimSpace(req.Prompt)
+	if req.Prompt == "" {
+		writeJSON(w, http.StatusBadRequest, errResp{Error: "prompt required"})
+		return
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode != "quality" {
+		mode = "fast"
+	}
+
+	// NDJSON streaming headers
+	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	key := cacheKey(req.Prompt, mode)
+	if v, ok := cacheGet(key); ok {
+		_ = writeNDJSON(w, streamMsg{Type: "status", Text: "cache hit"})
+		_ = writeNDJSON(w, streamMsg{Type: "delta", Text: v.Final})
+		v.Cached = true
+		_ = writeNDJSON(w, streamMsg{Type: "meta", Meta: v})
+		return
+	}
+
+	var (
+		providers []provider
+		timeout   time.Duration
+		cacheTTL  time.Duration
+	)
+	if mode == "quality" {
+		providers = []provider{
+			{name: "llama3.2", model: "llama3.2"},
+			{name: "qwen2.5", model: "qwen2.5"},
+			{name: "mistral", model: "mistral"},
+		}
+		timeout = 120 * time.Second
+		cacheTTL = 30 * time.Minute
+	} else {
+		providers = []provider{
+			{name: "llama3.2", model: "llama3.2"},
+			{name: "qwen2.5", model: "qwen2.5"},
+		}
+		timeout = 45 * time.Second
+		cacheTTL = 10 * time.Minute
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+
+	_ = writeNDJSON(w, streamMsg{Type: "status", Text: "running models..."})
+	cands := fanOut(ctx, providers, req.Prompt)
+	if len(cands) == 0 {
+		_ = writeNDJSON(w, streamMsg{Type: "error", Text: "no model responses (is Ollama running on localhost:11434?)"})
+		return
+	}
+
+	// FAST shortcut
+	if mode == "fast" && len(cands) >= 2 && shouldSkipJudgeInFastMode(cands) {
+		best := fastPick(cands)
+		_ = writeNDJSON(w, streamMsg{Type: "status", Text: "fast path (no judge)"})
+		_ = writeNDJSON(w, streamMsg{Type: "delta", Text: best.Text})
+
+		resp := AnswerResponse{Final: best.Text, Candidates: cands, Cached: false, Mode: mode}
+		cacheSet(key, resp, cacheTTL)
+		_ = writeNDJSON(w, streamMsg{Type: "meta", Meta: resp})
+		return
+	}
+
+	judgeModel := "llama3.2"
+	_ = writeNDJSON(w, streamMsg{Type: "status", Text: "judging candidates..."})
+
+	scores, err := judgeCandidates(ctx, judgeModel, req.Prompt, cands)
+	if err != nil {
+		best := fastPick(cands)
+		_ = writeNDJSON(w, streamMsg{Type: "status", Text: "judge failed; using best guess"})
+		_ = writeNDJSON(w, streamMsg{Type: "delta", Text: best.Text})
+
+		resp := AnswerResponse{Final: best.Text, Candidates: cands, Cached: false, Mode: mode}
+		cacheSet(key, resp, cacheTTL)
+		_ = writeNDJSON(w, streamMsg{Type: "meta", Meta: resp})
+		return
+	}
+
+	top := []Candidate{cands[scores[0].Idx]}
+	if len(scores) > 1 {
+		top = append(top, cands[scores[1].Idx])
+	}
+
+	// Stream the synthesis (real streaming)
+	_ = writeNDJSON(w, streamMsg{Type: "status", Text: "synthesizing..."})
+
+	synthP := synthPrompt(req.Prompt, top)
+
+	var final strings.Builder
+	merged, err := ollamaGenerateStream(ctx, judgeModel, synthP, func(delta string) error {
+		final.WriteString(delta)
+		return writeNDJSON(w, streamMsg{Type: "delta", Text: delta})
+	})
+	if err != nil || strings.TrimSpace(merged) == "" {
+		// Fallback to best judged candidate
+		best := cands[scores[0].Idx].Text
+		_ = writeNDJSON(w, streamMsg{Type: "status", Text: "synth failed; fallback to best candidate"})
+		_ = writeNDJSON(w, streamMsg{Type: "delta", Text: best})
+
+		resp := AnswerResponse{Final: best, Candidates: cands, Cached: false, Mode: mode}
+		cacheSet(key, resp, cacheTTL)
+		_ = writeNDJSON(w, streamMsg{Type: "meta", Meta: resp})
+		return
+	}
+
+	finalText := strings.TrimSpace(final.String())
+	resp := AnswerResponse{Final: finalText, Candidates: cands, Cached: false, Mode: mode}
+	cacheSet(key, resp, cacheTTL)
+	_ = writeNDJSON(w, streamMsg{Type: "meta", Meta: resp})
+}
+
 func main() {
 	http.HandleFunc("/answer", handleAnswer)
+	http.HandleFunc("/answer/stream", handleAnswerStream)
+
 	log.Println("Go backend listening on :8080 (expects Ollama on :11434)")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
