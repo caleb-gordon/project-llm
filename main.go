@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 
 type AnswerRequest struct {
 	Prompt string `json:"prompt"`
+	Mode   string `json:"mode"` // "fast" or "quality"
 }
 
 type Candidate struct {
@@ -28,6 +30,7 @@ type AnswerResponse struct {
 	Final      string      `json:"final"`
 	Candidates []Candidate `json:"candidates"`
 	Cached     bool        `json:"cached"`
+	Mode       string      `json:"mode"`
 }
 
 type errResp struct {
@@ -38,6 +41,39 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// -------------------- Cache (in-memory TTL) --------------------
+
+type cacheItem struct {
+	val AnswerResponse
+	exp time.Time
+}
+
+var (
+	cacheMu  sync.RWMutex
+	cacheMap = map[string]cacheItem{}
+)
+
+func cacheKey(prompt, mode string) string {
+	sum := sha256.Sum256([]byte(mode + "::" + prompt))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func cacheGet(key string) (AnswerResponse, bool) {
+	cacheMu.RLock()
+	it, ok := cacheMap[key]
+	cacheMu.RUnlock()
+	if !ok || time.Now().After(it.exp) {
+		return AnswerResponse{}, false
+	}
+	return it.val, true
+}
+
+func cacheSet(key string, val AnswerResponse, ttl time.Duration) {
+	cacheMu.Lock()
+	cacheMap[key] = cacheItem{val: val, exp: time.Now().Add(ttl)}
+	cacheMu.Unlock()
 }
 
 // -------------------- Ollama client --------------------
@@ -80,7 +116,6 @@ func ollamaGenerate(ctx context.Context, model, prompt string) (string, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", err
 	}
-
 	return strings.TrimSpace(out.Response), nil
 }
 
@@ -105,12 +140,15 @@ func fanOut(ctx context.Context, providers []provider, userPrompt string) []Cand
 		p := p
 		go func() {
 			defer wg.Done()
+
 			start := time.Now()
+			prompt := "Answer the user clearly and directly.\n" +
+				"Prefer correct, concise explanations and practical examples when helpful.\n\n" +
+				"User:\n" + userPrompt
 
-			prompt := "Answer the user clearly and directly.\n\nUser:\n" + userPrompt
 			text, err := ollamaGenerate(ctx, p.model, prompt)
-
 			lat := time.Since(start).Milliseconds()
+
 			if err != nil || strings.TrimSpace(text) == "" {
 				ch <- result{err: err}
 				return
@@ -130,6 +168,9 @@ func fanOut(ctx context.Context, providers []provider, userPrompt string) []Cand
 			cands = append(cands, r.c)
 		}
 	}
+
+	// Stable order: fastest first (nice for UI, also helps fast mode pick quickly if needed)
+	sort.Slice(cands, func(i, j int) bool { return cands[i].LatencyMs < cands[j].LatencyMs })
 	return cands
 }
 
@@ -186,7 +227,8 @@ func judgeCandidates(ctx context.Context, judgeModel string, userPrompt string, 
 func synthesize(ctx context.Context, synthModel string, userPrompt string, top []Candidate) (string, error) {
 	var b strings.Builder
 	b.WriteString("Combine the best parts of the answers below into ONE final answer.\n")
-	b.WriteString("Rules: be correct, remove contradictions, be concise, no fluff.\n\n")
+	b.WriteString("Rules: be correct, remove contradictions, be concise, no fluff.\n")
+	b.WriteString("If a step-by-step explanation is helpful, include it.\n\n")
 	b.WriteString("User prompt:\n")
 	b.WriteString(userPrompt)
 	b.WriteString("\n\nAnswers:\n")
@@ -196,6 +238,35 @@ func synthesize(ctx context.Context, synthModel string, userPrompt string, top [
 		b.WriteString(c.Text + "\n")
 	}
 	return ollamaGenerate(ctx, synthModel, b.String())
+}
+
+// Fast heuristic: skip judge+synth if answers are “close enough”
+func fastPick(cands []Candidate) Candidate {
+	// Prefer the one with more structure (newlines/bullets), then shorter latency
+	best := cands[0]
+	bestNL := strings.Count(best.Text, "\n")
+	for _, c := range cands[1:] {
+		nl := strings.Count(c.Text, "\n")
+		if nl > bestNL+1 {
+			best = c
+			bestNL = nl
+			continue
+		}
+	}
+	return best
+}
+
+func shouldSkipJudgeInFastMode(cands []Candidate) bool {
+	if len(cands) < 2 {
+		return true
+	}
+	// If lengths are similar, they likely agree; skip judge/synth for speed.
+	a, b := len(cands[0].Text), len(cands[1].Text)
+	diff := a - b
+	if diff < 0 {
+		diff = -diff
+	}
+	return diff < 350
 }
 
 // -------------------- HTTP handler --------------------
@@ -211,21 +282,53 @@ func handleAnswer(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errResp{Error: "bad json"})
 		return
 	}
+
 	req.Prompt = strings.TrimSpace(req.Prompt)
 	if req.Prompt == "" {
 		writeJSON(w, http.StatusBadRequest, errResp{Error: "prompt required"})
 		return
 	}
 
-	// Whole pipeline timeout (tune later)
-	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
-	defer cancel()
-
-	providers := []provider{
-		{name: "llama3.2", model: "llama3.2"},
-		{name: "qwen2.5", model: "qwen2.5"},
-		{name: "mistral", model: "mistral"},
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode != "quality" {
+		mode = "fast"
 	}
+
+	// Cache
+	key := cacheKey(req.Prompt, mode)
+	if v, ok := cacheGet(key); ok {
+		v.Cached = true
+		writeJSON(w, http.StatusOK, v)
+		return
+	}
+
+	// Time budgets
+	var (
+		providers []provider
+		timeout   time.Duration
+		cacheTTL  time.Duration
+	)
+	if mode == "quality" {
+		// Quality: 3 providers + judge + synth
+		providers = []provider{
+			{name: "llama3.2", model: "llama3.2"},
+			{name: "qwen2.5", model: "qwen2.5"},
+			{name: "mistral", model: "mistral"},
+		}
+		timeout = 120 * time.Second
+		cacheTTL = 30 * time.Minute
+	} else {
+		// Fast: 2 providers; judge/synth only when needed
+		providers = []provider{
+			{name: "llama3.2", model: "llama3.2"},
+			{name: "qwen2.5", model: "qwen2.5"},
+		}
+		timeout = 45 * time.Second
+		cacheTTL = 10 * time.Minute
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
 
 	cands := fanOut(ctx, providers, req.Prompt)
 	if len(cands) == 0 {
@@ -233,27 +336,59 @@ func handleAnswer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Judge using one model
-	scores, err := judgeCandidates(ctx, "llama3.2", req.Prompt, cands)
-	if err != nil {
-		// Fallback: fastest candidate
-		sort.Slice(cands, func(i, j int) bool { return cands[i].LatencyMs < cands[j].LatencyMs })
-		writeJSON(w, http.StatusOK, AnswerResponse{Final: cands[0].Text, Candidates: cands, Cached: false})
+	// If only 1 came back, just return it.
+	if len(cands) == 1 {
+		resp := AnswerResponse{Final: cands[0].Text, Candidates: cands, Cached: false, Mode: mode}
+		cacheSet(key, resp, cacheTTL)
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 
-	// Top-2 synthesis
+	// FAST MODE: often skip judge+synth
+	if mode == "fast" && shouldSkipJudgeInFastMode(cands) {
+		best := fastPick(cands)
+		resp := AnswerResponse{Final: best.Text, Candidates: cands, Cached: false, Mode: mode}
+		cacheSet(key, resp, cacheTTL)
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	// Judge + (optional) synth
+	judgeModel := "llama3.2"
+	scores, err := judgeCandidates(ctx, judgeModel, req.Prompt, cands)
+	if err != nil {
+		// Fallback: pick best heuristic
+		best := fastPick(cands)
+		resp := AnswerResponse{Final: best.Text, Candidates: cands, Cached: false, Mode: mode}
+		cacheSet(key, resp, cacheTTL)
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	// Take top 2 for synthesis
 	top := []Candidate{cands[scores[0].Idx]}
 	if len(scores) > 1 {
 		top = append(top, cands[scores[1].Idx])
 	}
 
-	final, err := synthesize(ctx, "llama3.2", req.Prompt, top)
-	if err != nil || strings.TrimSpace(final) == "" {
-		final = cands[scores[0].Idx].Text
+	final := cands[scores[0].Idx].Text
+	// Only synthesize in quality mode OR when judge thinks top answers differ meaningfully
+	if mode == "quality" {
+		if merged, err := synthesize(ctx, judgeModel, req.Prompt, top); err == nil && strings.TrimSpace(merged) != "" {
+			final = merged
+		}
+	} else {
+		// Fast mode: synthesize only if top answer is short or unstructured
+		if len(final) < 500 {
+			if merged, err := synthesize(ctx, judgeModel, req.Prompt, top); err == nil && strings.TrimSpace(merged) != "" {
+				final = merged
+			}
+		}
 	}
 
-	writeJSON(w, http.StatusOK, AnswerResponse{Final: final, Candidates: cands, Cached: false})
+	resp := AnswerResponse{Final: final, Candidates: cands, Cached: false, Mode: mode}
+	cacheSet(key, resp, cacheTTL)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func main() {
